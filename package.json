@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-multi-bot-controller-satori-ai-charon",
-  "description": "\u0016\u0016Charon, the ancient Greek god of the river Styx, is configured to assign each Bot an independent satori-ai persona.",
-  "version": "0.0.1",
+  "description": "Charon, the ancient Greek god of the River Styx, is configured to assign each Bot an independent satori-ai prompts and models, achieving persona isolation across multiple Bots.",
+  "version": "0.1.0",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
@@ -9,14 +9,22 @@
     "dist"
   ],
   "license": "MIT",
-  "scripts": {},
   "keywords": [
     "chatbot",
     "koishi",
-    "plugin"
+    "plugin",
+    "multi-bot",
+    "satori-ai",
+    "data-isolation"
   ],
-  "devDependencies": {},
+  "koishi": {
+    "description": {
+      "zh": "古希腊掌管冥河渡河的神，用于为每个 Bot 配置独立的 satori-ai 提示词和模型，实现多 Bot 不同人设的隔离。"
+    }
+  },
   "peerDependencies": {
-    "koishi": "^4.18.7"
+    "koishi": "^4.18.7",
+    "koishi-plugin-multi-bot-controller": "^1.0.5",
+    "koishi-plugin-satori-ai": "*"
   }
 }
