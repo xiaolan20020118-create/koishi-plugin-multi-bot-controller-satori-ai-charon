@@ -268,39 +268,26 @@ export function apply(ctx: Context, config: Config): void {
   // 中间件：在 satori-ai 处理消息前虚拟化 session 并设置 async 上下文
   // ========================================
   ctx.middleware(async (session, next) => {
-    // 始终记录进入中间件的日志
-    logger.info(`[MIDDLEWARE] >>> ENTER session.userId=${session.userId}, session.selfId=${session.selfId}, session.platform=${session.platform}`)
-
     // 获取当前 bot 的配置
     const botId = botManager.getBotId(session.platform || '', session.selfId || '')
-    logger.info(`[MIDDLEWARE] 检测到的 botId: "${botId}"`)
 
     const botConfig = botManager.getBotConfig(botId)
-    logger.info(`[MIDDLEWARE] botConfig 存在: ${!!botConfig}`)
 
     // 如果没有此 bot 的配置，直接放行
     if (!botConfig) {
-      logger.info(`[MIDDLEWARE] 没有 botConfig，直接放行`)
       return next()
     }
 
     // 使用 AsyncLocalStorage 设置 botId 上下文
     // 这样所有后续的异步操作（包括 satori-ai 的命令处理）都能访问到 botId
     return virtualizer.asyncContext.run(botId, async () => {
-      logger.info(`[MIDDLEWARE] 设置 botId 上下文: ${botId}, asyncContext.getStore()="${virtualizer.asyncContext.getStore()}"`)
-
-      // 创建虚拟化的 session
-      const virtualSession = virtualizer.createVirtualSession(session, botId)
-
+      // debug 模式下输出详细日志
       if (config.debug) {
-        logger.debug(`Bot ${botId} 消息处理: userId=${virtualSession.userId}, channelId=${virtualSession.channelId}`)
+        logger.debug(`[MIDDLEWARE] Bot ${botId} 处理消息: userId=${session.userId}`)
       }
 
       // 调用 next() 继续处理消息
-      // satori-ai 的命令处理会继承这个 AsyncLocalStorage 上下文
-      logger.info(`[MIDDLEWARE] 调用 next() 之前 asyncContext: ${virtualizer.asyncContext.getStore()}`)
       const result = await next()
-      logger.info(`[MIDDLEWARE] next() 完成后 asyncContext: ${virtualizer.asyncContext.getStore()}`)
 
       return result
     })

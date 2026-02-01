@@ -22,10 +22,14 @@ export class SessionVirtualizer {
   private originalAPIClient: any
   private originalSATConfig: any
 
-  // 配置访问日志聚合
-  private configAccessLog: Map<string, number> = new Map()
-  private lastConfigAccessKey = ''
-  private lastConfigAccessCount = 0
+  // APIClient 缓存：按 botId 缓存实例，配置变更时自动失效
+  private apiClientCache: Map<string, { client: any; configHash: string }> = new Map()
+  private apiClientConfigVersions: Map<string, string> = new Map()
+
+  // 配置拦截统计：用于聚合日志输出
+  private configInterceptStats: Map<string, Set<string>> = new Map()
+  private lastAccessBotId = ''
+  private interceptFlushTimer: NodeJS.Timeout | null = null
 
   constructor(
     private ctx: Context,
@@ -42,6 +46,40 @@ export class SessionVirtualizer {
   }
 
   /**
+   * 计算配置哈希值，用于检测配置变更
+   */
+  private getConfigHash(botId: string): string {
+    const reasonerConfig = this.botReasonerModels.get(botId)
+    const notReasonerConfig = this.botNotReasonerModels.get(botId)
+
+    // 对配置进行标准化后生成哈希（忽略 undefined 值和顺序）
+    const normalized = {
+      reasoner: reasonerConfig ? {
+        model: reasonerConfig.model,
+        baseURL: reasonerConfig.baseURL || null,
+        apiKey: reasonerConfig.apiKey || null,
+      } : null,
+      notReasoner: notReasonerConfig ? {
+        model: notReasonerConfig.model,
+        baseURL: notReasonerConfig.baseURL || null,
+        apiKey: notReasonerConfig.apiKey || null,
+      } : null,
+    }
+
+    return JSON.stringify(normalized)
+  }
+
+  /**
+   * 使 APIClient 缓存失效
+   * 在配置变更时调用
+   */
+  private invalidateAPIClientCache(botId: string): void {
+    this.apiClientCache.delete(botId)
+    this.apiClientConfigVersions.delete(botId)
+    this.debug(`Bot ${botId} 的 APIClient 缓存已失效`)
+  }
+
+  /**
    * 设置 bot 的提示词（人设）
    */
   setBotPrompt(botId: string, prompt: string): void {
@@ -51,17 +89,21 @@ export class SessionVirtualizer {
 
   /**
    * 设置 bot 的深度思考模型配置
+   * 配置变更时自动失效 APIClient 缓存
    */
   setBotReasonerModel(botId: string, config: { model: string; baseURL?: string; apiKey?: string[] }): void {
     this.botReasonerModels.set(botId, config)
+    this.invalidateAPIClientCache(botId)
     this.debug(`设置 Bot ${botId} 的深度思考模型: ${config.model}`)
   }
 
   /**
    * 设置 bot 的非思考模型配置
+   * 配置变更时自动失效 APIClient 缓存
    */
   setBotNotReasonerModel(botId: string, config: { model: string; baseURL?: string; apiKey?: string[] }): void {
     this.botNotReasonerModels.set(botId, config)
+    this.invalidateAPIClientCache(botId)
     this.debug(`设置 Bot ${botId} 的非思考模型: ${config.model}`)
   }
 
@@ -79,6 +121,49 @@ export class SessionVirtualizer {
   setBotMoodConfig(botId: string, config: BotPersonaConfig['moodConfig']): void {
     this.botMoodConfigs.set(botId, config)
     this.debug(`设置 Bot ${botId} 的心情配置`)
+  }
+
+  /**
+   * 跟踪配置访问（用于检测 botId 变化）
+   */
+  private trackConfigAccess(botId: string): void {
+    if (this.lastAccessBotId && this.lastAccessBotId !== botId) {
+      // botId 变化，立即输出之前的统计
+      this.flushConfigInterceptStats(this.lastAccessBotId)
+    }
+    this.lastAccessBotId = botId
+  }
+
+  /**
+   * 跟踪配置拦截（延迟聚合输出）
+   */
+  private trackConfigIntercept(botId: string, prop: string): void {
+    if (!this.configInterceptStats.has(botId)) {
+      this.configInterceptStats.set(botId, new Set())
+    }
+    this.configInterceptStats.get(botId)!.add(prop)
+
+    // 延迟输出，聚合同一 bot 的多次配置访问
+    if (this.interceptFlushTimer) {
+      clearTimeout(this.interceptFlushTimer)
+    }
+    this.interceptFlushTimer = setTimeout(() => {
+      this.flushConfigInterceptStats(botId)
+    }, 50)
+  }
+
+  /**
+   * 输出配置拦截统计（聚合日志）
+   */
+  private flushConfigInterceptStats(botId: string): void {
+    const props = this.configInterceptStats.get(botId)
+    if (!props || props.size === 0) return
+
+    const count = props.size
+    this.logger.info(`[CONFIG] Bot ${botId} 好感度/心情配置已应用 (${count}项)`)
+
+    // 清空统计
+    this.configInterceptStats.delete(botId)
   }
 
   /**
@@ -173,21 +258,6 @@ export class SessionVirtualizer {
   }
 
   /**
-   * 从 Session 提取 botId（支持虚拟化后的 session）
-   */
-  extractBotIdFromSession(session: Session): string {
-    // 首先检查内部属性
-    if ((session as any).__charonBotId) {
-      return (session as any).__charonBotId
-    }
-    // 从 userId 提取
-    if (session.userId) {
-      return this.extractBotId(session.userId)
-    }
-    return ''
-  }
-
-  /**
    * 包装数据库 get 方法，拦截对 p_system 表的查询
    * 将虚拟化的 userId 映射回真实的 userId，并添加 botId 过滤
    */
@@ -258,6 +328,27 @@ export class SessionVirtualizer {
     this.originalAPIClient = satInstance.apiClient
     this.logger.info('[API CLIENT] 原始 APIClient 已保存')
 
+    // 创建配置属性映射表，用于统一处理好感度、心情等配置属性
+    // key: 属性名, value: { configMap: 配置Map, desc: 日志描述 }
+    const configPropertyMap = new Map<string, { configMap: Map<string, any>; desc: string }>([
+      // 好感度属性
+      ['prompt_0', { configMap: this.botFavorabilityConfigs, desc: '好感度设定' }],
+      ['favorability_div_1', { configMap: this.botFavorabilityConfigs, desc: '好感度分界线' }],
+      ['prompt_1', { configMap: this.botFavorabilityConfigs, desc: '好感度设定' }],
+      ['favorability_div_2', { configMap: this.botFavorabilityConfigs, desc: '好感度分界线' }],
+      ['prompt_2', { configMap: this.botFavorabilityConfigs, desc: '好感度设定' }],
+      ['favorability_div_3', { configMap: this.botFavorabilityConfigs, desc: '好感度分界线' }],
+      ['prompt_3', { configMap: this.botFavorabilityConfigs, desc: '好感度设定' }],
+      ['favorability_div_4', { configMap: this.botFavorabilityConfigs, desc: '好感度分界线' }],
+      ['prompt_4', { configMap: this.botFavorabilityConfigs, desc: '好感度设定' }],
+      // 心情属性
+      ['mood_prompt_0', { configMap: this.botMoodConfigs, desc: '心情设定' }],
+      ['mood_div_1', { configMap: this.botMoodConfigs, desc: '心情分界线' }],
+      ['mood_prompt_1', { configMap: this.botMoodConfigs, desc: '心情设定' }],
+      ['mood_div_2', { configMap: this.botMoodConfigs, desc: '心情分界线' }],
+      ['mood_prompt_2', { configMap: this.botMoodConfigs, desc: '心情设定' }],
+    ])
+
     // 包装 config 对象，拦截各种配置属性访问
     const wrappedConfig = new Proxy(this.originalSATConfig, {
       get(target, prop: string) {
@@ -271,30 +362,17 @@ export class SessionVirtualizer {
           return returnValue
         }
 
+        // 聚合配置访问统计
+        self.trackConfigAccess(currentBotId)
+
         const reasonerConfig = self.botReasonerModels.get(currentBotId)
         const notReasonerConfig = self.botNotReasonerModels.get(currentBotId)
-
-        // 聚合日志：记录配置访问
-        const accessKey = `${currentBotId}:${String(prop)}`
-        const currentCount = self.configAccessLog.get(accessKey) || 0
-        self.configAccessLog.set(accessKey, currentCount + 1)
-
-        // 当访问的属性发生变化时，输出之前属性的聚合统计
-        if (self.lastConfigAccessKey && self.lastConfigAccessKey !== accessKey) {
-          const prevCount = self.configAccessLog.get(self.lastConfigAccessKey) || 0
-          if (prevCount > 1) {
-            const [botId, prop] = self.lastConfigAccessKey.split(':')
-            self.logger.info(`[CONFIG ACCESS] ${botId}.${prop} accessed ${prevCount} times`)
-          }
-          self.configAccessLog.set(self.lastConfigAccessKey, 0)
-        }
-        self.lastConfigAccessKey = accessKey
 
         // 拦截深度思考模型名称
         if (prop === 'appointModel') {
           if (reasonerConfig?.model) {
             returnValue = reasonerConfig.model
-            self.logger.info(`[CONFIG INTERCEPT] prop=appointModel -> ${returnValue}`)
+            self.logger.info(`[CONFIG] 模型: ${returnValue}`)
           }
         }
 
@@ -302,7 +380,7 @@ export class SessionVirtualizer {
         else if (prop === 'baseURL') {
           if (reasonerConfig?.baseURL) {
             returnValue = reasonerConfig.baseURL
-            self.logger.info(`[CONFIG INTERCEPT] prop=baseURL -> ${returnValue}`)
+            self.logger.info(`[CONFIG] API地址: ${returnValue}`)
           }
         }
 
@@ -310,26 +388,26 @@ export class SessionVirtualizer {
         else if (prop === 'key') {
           if (reasonerConfig?.apiKey) {
             returnValue = reasonerConfig.apiKey
-            self.logger.info(`[CONFIG INTERCEPT] prop=key -> [${returnValue.length} keys]`)
+            self.logger.info(`[CONFIG] API密钥: ${returnValue.length}个`)
           }
         }
 
         // 拦截非思考模型名称
         else if (prop === 'not_reasoner_LLM' && notReasonerConfig?.model) {
           returnValue = notReasonerConfig.model
-          self.logger.info(`[CONFIG INTERCEPT] prop=not_reasoner_LLM -> ${returnValue}`)
+          self.logger.info(`[CONFIG] 非思考模型: ${returnValue}`)
         }
 
         // 拦截非思考模型的 API 地址
         else if (prop === 'not_reasoner_LLM_URL' && notReasonerConfig?.baseURL) {
           returnValue = notReasonerConfig.baseURL
-          self.logger.info(`[CONFIG INTERCEPT] prop=not_reasoner_LLM_URL -> ${returnValue}`)
+          self.logger.info(`[CONFIG] 非思考API地址: ${returnValue}`)
         }
 
         // 拦截非思考模型的 API Key
         else if (prop === 'not_reasoner_LLM_key' && notReasonerConfig?.apiKey) {
           returnValue = notReasonerConfig.apiKey
-          self.logger.info(`[CONFIG INTERCEPT] prop=not_reasoner_LLM_key -> [${returnValue.length} keys]`)
+          self.logger.info(`[CONFIG] 非思考API密钥: ${returnValue.length}个`)
         }
 
         // 拦截 prompt 属性 - 返回配置的 prompt
@@ -337,61 +415,20 @@ export class SessionVirtualizer {
           const botPrompt = self.botPrompts.get(currentBotId)
           if (botPrompt) {
             returnValue = botPrompt
-            self.logger.info(`[CONFIG INTERCEPT] prop=prompt -> 返回配置的 prompt (${botPrompt.length} chars)`)
+            self.logger.info(`[CONFIG] 人设提示词: ${botPrompt.slice(0, 30)}...(${botPrompt.length}字符)`)
           }
         }
 
-        // 拦截好感度配置属性
-        const favorabilityConfig = self.botFavorabilityConfigs.get(currentBotId)
-        if (favorabilityConfig) {
-          if (prop === 'prompt_0' && favorabilityConfig.prompt_0 !== undefined) {
-            returnValue = favorabilityConfig.prompt_0
-            self.logger.info(`[CONFIG INTERCEPT] prop=prompt_0 -> 返回配置的好感度设定`)
-          } else if (prop === 'favorability_div_1' && favorabilityConfig.favorability_div_1 !== undefined) {
-            returnValue = favorabilityConfig.favorability_div_1
-            self.logger.info(`[CONFIG INTERCEPT] prop=favorability_div_1 -> ${returnValue}`)
-          } else if (prop === 'prompt_1' && favorabilityConfig.prompt_1 !== undefined) {
-            returnValue = favorabilityConfig.prompt_1
-            self.logger.info(`[CONFIG INTERCEPT] prop=prompt_1 -> 返回配置的好感度设定`)
-          } else if (prop === 'favorability_div_2' && favorabilityConfig.favorability_div_2 !== undefined) {
-            returnValue = favorabilityConfig.favorability_div_2
-            self.logger.info(`[CONFIG INTERCEPT] prop=favorability_div_2 -> ${returnValue}`)
-          } else if (prop === 'prompt_2' && favorabilityConfig.prompt_2 !== undefined) {
-            returnValue = favorabilityConfig.prompt_2
-            self.logger.info(`[CONFIG INTERCEPT] prop=prompt_2 -> 返回配置的好感度设定`)
-          } else if (prop === 'favorability_div_3' && favorabilityConfig.favorability_div_3 !== undefined) {
-            returnValue = favorabilityConfig.favorability_div_3
-            self.logger.info(`[CONFIG INTERCEPT] prop=favorability_div_3 -> ${returnValue}`)
-          } else if (prop === 'prompt_3' && favorabilityConfig.prompt_3 !== undefined) {
-            returnValue = favorabilityConfig.prompt_3
-            self.logger.info(`[CONFIG INTERCEPT] prop=prompt_3 -> 返回配置的好感度设定`)
-          } else if (prop === 'favorability_div_4' && favorabilityConfig.favorability_div_4 !== undefined) {
-            returnValue = favorabilityConfig.favorability_div_4
-            self.logger.info(`[CONFIG INTERCEPT] prop=favorability_div_4 -> ${returnValue}`)
-          } else if (prop === 'prompt_4' && favorabilityConfig.prompt_4 !== undefined) {
-            returnValue = favorabilityConfig.prompt_4
-            self.logger.info(`[CONFIG INTERCEPT] prop=prompt_4 -> 返回配置的好感度设定`)
-          }
-        }
-
-        // 拦截心情配置属性
-        const moodConfig = self.botMoodConfigs.get(currentBotId)
-        if (moodConfig) {
-          if (prop === 'mood_prompt_0' && moodConfig.mood_prompt_0 !== undefined) {
-            returnValue = moodConfig.mood_prompt_0
-            self.logger.info(`[CONFIG INTERCEPT] prop=mood_prompt_0 -> 返回配置的心情设定`)
-          } else if (prop === 'mood_div_1' && moodConfig.mood_div_1 !== undefined) {
-            returnValue = moodConfig.mood_div_1
-            self.logger.info(`[CONFIG INTERCEPT] prop=mood_div_1 -> ${returnValue}`)
-          } else if (prop === 'mood_prompt_1' && moodConfig.mood_prompt_1 !== undefined) {
-            returnValue = moodConfig.mood_prompt_1
-            self.logger.info(`[CONFIG INTERCEPT] prop=mood_prompt_1 -> 返回配置的心情设定`)
-          } else if (prop === 'mood_div_2' && moodConfig.mood_div_2 !== undefined) {
-            returnValue = moodConfig.mood_div_2
-            self.logger.info(`[CONFIG INTERCEPT] prop=mood_div_2 -> ${returnValue}`)
-          } else if (prop === 'mood_prompt_2' && moodConfig.mood_prompt_2 !== undefined) {
-            returnValue = moodConfig.mood_prompt_2
-            self.logger.info(`[CONFIG INTERCEPT] prop=mood_prompt_2 -> 返回配置的心情设定`)
+        // 统一拦截好感度、心情等配置属性（聚合输出）
+        else {
+          const mapping = configPropertyMap.get(prop)
+          if (mapping) {
+            const botConfig = mapping.configMap.get(currentBotId)
+            if (botConfig && botConfig[prop] !== undefined) {
+              returnValue = botConfig[prop]
+              // 记录到统计中，延迟输出
+              self.trackConfigIntercept(currentBotId, prop)
+            }
           }
         }
 
@@ -422,11 +459,19 @@ export class SessionVirtualizer {
     Object.defineProperty(satInstance, 'apiClient', {
       get() {
         const botId = self.getCurrentBotId()
-        self.logger.info(`[API CLIENT GET] currentBotId=${botId || '<EMPTY>'}`)
 
         // 如果没有 botId 上下文，返回原始 apiClient（兼容其他调用）
         if (!botId) {
           return self.originalAPIClient
+        }
+
+        // 计算当前配置的哈希值
+        const currentConfigHash = self.getConfigHash(botId)
+
+        // 检查缓存是否存在且配置未变更
+        const cached = self.apiClientCache.get(botId)
+        if (cached && cached.configHash === currentConfigHash) {
+          return cached.client
         }
 
         // 返回一个包装的 apiClient，其 chat 方法会使用 bot 特定的配置
@@ -443,11 +488,8 @@ export class SessionVirtualizer {
                 const reasonerConfig = self.botReasonerModels.get(botId)
                 const notReasonerConfig = self.botNotReasonerModels.get(botId)
 
-                self.logger.info(`[API CLIENT CHAT] botId=${botId}, hasReasonerConfig=${!!reasonerConfig}, hasNotReasonerConfig=${!!notReasonerConfig}`)
-
                 // 如果没有特殊配置，使用原始 apiClient
                 if (!reasonerConfig && !notReasonerConfig) {
-                  self.logger.info(`[API CLIENT CHAT] 使用原始 apiClient`)
                   return target.chat.apply(target, args)
                 }
 
@@ -473,20 +515,33 @@ export class SessionVirtualizer {
                   max_output_tokens: originalConfig.max_output_tokens,
                 }
 
-                self.logger.info(`[API CLIENT CHAT] 动态配置 baseURL=${dynamicConfig.baseURL}, model=${dynamicConfig.appointModel}`)
-
                 // 创建一个新的 APIClient 实例
                 const APIClientClass = Object.getPrototypeOf(target).constructor
                 const dynamicAPIClient = new APIClientClass(self.ctx, dynamicConfig)
 
-                // 使用新创建的 APIClient 调用 chat
-                return dynamicAPIClient.chat.apply(dynamicAPIClient, args)
+                // 缓存新创建的 APIClient
+                self.apiClientCache.set(botId, {
+                  client: dynamicAPIClient,
+                  configHash: currentConfigHash,
+                })
+
+                // 使用 asyncContext.run 确保 chat 调用时 botId 上下文存在
+                // 这样 dynamicAPIClient 内部访问 config 时能正确获取 bot 特定配置
+                return self.asyncContext.run(botId, () => {
+                  return dynamicAPIClient.chat.apply(dynamicAPIClient, args)
+                })
               }
             }
 
             // 其他方法直接返回原始方法
             return target[method]
           }
+        })
+
+        // 将包装后的 client 也存入缓存（用于非 chat 方法的调用）
+        self.apiClientCache.set(botId, {
+          client: wrappedAPIClient,
+          configHash: currentConfigHash,
         })
 
         return wrappedAPIClient

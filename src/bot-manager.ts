@@ -108,13 +108,4 @@ export class BotManager {
       this.logger.debug(args)
     }
   }
-
-  /**
-   * 输出详细日志
-   */
-  verbose(...args: unknown[]): void {
-    if (this.options.verboseLogging) {
-      this.logger.info(args)
-    }
-  }
 }
